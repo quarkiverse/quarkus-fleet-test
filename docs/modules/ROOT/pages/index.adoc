@@ -1,0 +1,101 @@
+= Quarkus Fleet Test
+
+include::./includes/attributes.adoc[]
+
+**Run several instances of your application behind a load balancer, inside one JUnit test.**
+
+Some bugs do not exist until there is more than one copy of the application running: a login that works on the
+instance that issued the cookie and fails on the next, a scheduled report sent once per replica, a cache that is
+fresh on the instance that wrote and stale on the one that reads, an overloaded replica that takes its neighbours
+down with it, requests dropped at every rolling restart. A `@QuarkusTest` runs one instance and cannot see any of
+them. They are found in production, or in a staging cluster by someone reading logs.
+
+A `@QuarkusFleetTest` starts N processes of the packaged application, puts a TCP load balancer in front of them,
+and lets the test talk to the fleet or to one instance. Dev Services start once and every instance shares them.
+The load balancer can follow readiness like a kubelet, keep routing to a stopped instance for as long as an
+endpoint change takes to propagate, and refuse or fail open when nothing is ready.
+
+== A first test
+
+Add the dependency in test scope:
+
+[source,xml,subs=attributes+]
+----
+<dependency>
+    <groupId>io.quarkiverse.fleettest</groupId>
+    <artifactId>quarkus-fleet-test</artifactId>
+    <version>{project-version}</version>
+    <scope>test</scope>
+</dependency>
+----
+
+Write an integration test. Like `@QuarkusIntegrationTest`, it runs against the artifact the build produced, so it
+runs under the failsafe plugin after `mvn package`:
+
+[source,java]
+----
+@QuarkusFleetTest(instances = 2)
+class InventoryFleetIT {
+
+    @InjectFleet
+    Fleet fleet;
+
+    @Test
+    void aWriteOnOneInstanceIsVisibleOnTheOther() {
+        fleet.pin(0);                                                  // <1>
+        given().body("{\"sku\":\"A1\",\"count\":3}").post("/inventory").then().statusCode(201);
+
+        fleet.pin(1);
+        given().get("/inventory/A1").then().statusCode(200).body("count", is(3));   // <2>
+    }
+}
+----
+<1> RestAssured and `@TestHTTPResource` point at the load balancer; `pin` sends every new connection to one
+instance. Routing goes back to round-robin after each test.
+<2> With a local cache in front of the inventory, this fails: instance 1 has never seen SKU A1 and its cache
+says so. With a shared cache or no cache, it passes.
+
+`fleet.instance(1).url()` addresses one instance directly, `fleet.instance(1).stop()` and `start()` take it out
+of and back into the fleet, `kill()` crashes it, and `pause()` and `resume()` freeze it with everything it holds. The
+xref:load-balancer.adoc[load balancer] page has the whole surface.
+
+== What it is for
+
+The xref:scenarios.adoc[scenarios] page lists what a two-instance fleet catches, grouped by how deterministic the
+test is, and the nineteen scenarios shipped in this repository as runnable samples, each with a broken and
+a fixed version of the same application:
+
+* a `@Scheduled` report sent once per instance, fixed by claiming the tick in the shared database;
+* a form login lost on the next instance, fixed by one `quarkus.http.auth.session.encryption-key`;
+* requests dropped during a rolling restart, fixed by `quarkus.shutdown.delay`;
+* a leader frozen past its lease that records its work twice, fixed by a fencing token;
+* a Kafka consumer killed before committing its offsets, whose orders are shipped twice, fixed by an idempotent
+consumer;
+* a new replica that receives traffic before it can serve, fixed by a readiness probe;
+* an `Idempotency-Key` honoured by the instance that saw it and by no other, fixed by the extension's JDBC store.
+* an OIDC login started on one instance that the other cannot finish, fixed by one
+`quarkus.oidc.authentication.state-secret`;
+* a local cache invalidated on the instance that wrote and stale on the other, fixed by telling every instance
+over Redis pub/sub;
+* a `@RateLimit` that lets a client through five times per instance, fixed by a counter in Redis;
+* a WebSocket broadcast heard only by the clients of the sending instance, fixed by a Redis relay;
+* two outbox pollers that both send every notification, fixed by `FOR UPDATE SKIP LOCKED`;
+* connection pools that together exceed the database's `max_connections`, fixed by sizing the pool per replica;
+* a withdrawal lost to a read-modify-write on two instances, fixed by locking the row;
+* two transfers that deadlock by locking the same rows in opposite order, fixed by a consistent lock order;
+* a booking limit broken by write skew that no row lock can stop, fixed by `SERIALIZABLE` isolation;
+* causally ordered events applied out of order by two instances, fixed by a per-aggregate lock and a sequence check;
+* an import that dies with the instance that ran it, fixed by a checkpoint and a reaper on every instance;
+* an upload stored on one instance's disk and a 404 on the other, fixed by shared storage;
+
+== How it works
+
+* The instances are launched by the same `ArtifactLauncher` providers `@QuarkusIntegrationTest` uses, so jars,
+containers and native binaries all work, each process with its own log file and a free port.
+* Dev Services are started once, in the test JVM, exactly as for `@QuarkusIntegrationTest`, and their
+configuration is passed to every instance: N instances, one database, one broker.
+* `@TestProfile` config overrides reach every instance; test resources from a profile or `@WithTestResource`
+run once. Each test class gets a fleet of its own.
+* The load balancer is a TCP proxy on Vert.x: it chooses an instance per connection, like a Kubernetes
+`Service`, and the bytes go through untouched, whatever the protocol.
+* When a test fails, the fleet's state, a timeline of what the balancer did (timestamped to line up with the logs) and each instance's log tail are printed and written under `target/fleet-test/`. See xref:load-balancer.adoc#when-a-test-fails[When a test fails].

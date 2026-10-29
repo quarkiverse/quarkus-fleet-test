@@ -1,0 +1,217 @@
+= What a fleet test catches
+
+include::./includes/attributes.adoc[]
+
+A test that can route a request to the instance of its choice, hold an instance at its limit, stop, kill or
+freeze one, start one late, and watch what the balancer does with readiness, catches a specific class of
+production bugs. They fall into three groups by how deterministic the test is.
+
+== Deterministic by routing alone
+
+The outcome depends only on which instance handled which request. `pin(i)` and `instance(i).url()` are all it
+takes, and the test runs in a second.
+
+[cols="2,2,3"]
+|===
+| Bug | Where it comes from | The test
+
+| Local cache treated as global
+| `quarkus-cache` with Caffeine, Hibernate's second-level cache with a local provider
+| Write through A, read through B, expect the new value. Shipped: `samples/local-cache`
+
+| Per-instance limits multiplied by N
+| SmallRye Fault Tolerance `@RateLimit`, `@Bulkhead`, `@CircuitBreaker`: their state is per JVM
+| Send limit+1 split across A and B, expect a rejection. Shipped: `samples/rate-limit`
+
+| A scheduled job on every replica
+| `@Scheduled`, Quartz without clustering
+| The job writes a row per run to the shared database; expect one row per tick. Shipped: `samples/scheduled-job`
+
+| A login valid on one instance only
+| Form authentication without `quarkus.http.auth.session.encryption-key`: each instance generates a key; OIDC with mTLS credentials and no `token-state-manager.encryption-secret`
+| Log in through A, use the cookie through B, expect 200. Shipped: `samples/form-auth`
+
+| A login that cannot be finished where it was started
+| OIDC with PKCE or a nonce: the state cookie is encrypted with a key derived from the client secret when that is at least 32 characters long, and generated per instance otherwise; a short secret, a public client, or mTLS credentials
+| Start the code flow through A, log in at the provider, follow the redirect back through B, expect the login to complete. Shipped: `samples/oidc-login`
+
+| A token signed with a generated key
+| SmallRye JWT with a key generated at startup
+| Mint through A, present to B
+
+| A broadcast that reaches one instance's clients
+| WebSockets Next `OpenConnections`, SSE, the Vert.x event bus without clustering, in-memory Reactive Messaging channels
+| Connect client 1 to A and client 2 to B, broadcast from A, expect client 2 to hear it. Shipped: `samples/websocket-broadcast`
+
+| Submit here, poll there
+| Any in-memory job registry, upload staged on local disk, in-memory idempotency keys or ID generators
+| Submit through A, read through B. Shipped: `samples/upload-local-disk`
+
+| An idempotency key known to one instance
+| https://github.com/quarkiverse/quarkus-http-idempotency[Quarkus HTTP Idempotency] with its default `in-memory` store, or any idempotency, rate-limit or deduplication state kept in the process
+| Send a `POST` with an `Idempotency-Key` through A, retry it through B; expect a replay with `Idempotent-Replayed: true`, not a second execution. Shipped: `samples/idempotency`
+
+| Keep-alive clients pinned to one instance
+| REST Client, gRPC, HTTP/2, JDBC: per-connection balancing
+| One pooled client, N requests, expect every instance to have served some. Shipped: `FleetSmokeIT` in `integration-tests/basic`
+
+| Pool times replicas above the database's limit
+| Agroal `min-size` on every instance against one `max_connections`
+| The Nth instance fails to acquire at startup, or serves with too few connections. Shipped: `samples/pool-exhaustion`
+| A lost update
+| Read, compute, write in Java with an in-JVM lock around it: the lock protects one process, the database sees two
+| Hold a withdrawal on A past its read, withdraw on B, expect the sum of both. Shipped: `samples/lost-update`
+
+| Two pollers over one table
+| Any `@Scheduled` poller that selects pending rows and then updates them: both instances select the same rows
+| Hold a drain on A past its select, drain on B, expect each row handled once. Shipped: `samples/outbox-double-send`
+
+| A deadlock from lock order
+| Two transactions that lock the same rows in opposite order; an in-JVM lock makes one instance safe
+| Hold a transfer A→B on one instance past its first lock, run B→A on the other, expect one deadlock abort. Shipped: `samples/distributed-deadlock`
+
+| A broken invariant from write skew
+| A limit or invariant each transaction checks and keeps alone, over rows no single-row lock covers
+| Hold a booking on A past its count check, book on B, expect the limit broken. Shipped: `samples/write-skew`
+
+| Events applied out of order
+| Causally ordered events for one key, pulled by competing consumers with no per-key ordering
+| Apply the earlier event slowly on A while the later one commits on B, expect the wrong terminal state. Shipped: `samples/event-ordering`
+
+|===
+
+== Deterministic with a process controlled by the test
+
+These need an instance that is overloaded, frozen, dead or late on cue. Requests that block until the test lets
+them go, `pause()`, `kill()` and `running` do that. The balancer's readiness emulation does the rest.
+
+[cols="2,2,3"]
+|===
+| Bug | Where it comes from | The test
+
+| A zombie leader
+| Leader election or a job lock with a lease: a leader frozen past its lease (GC pause, VM migration, partition) still believes it leads, and finishes the write it was on
+| `pause()` the leader mid-work, wait for the other instance to take the lease and do the work, `resume()`; expect the zombie's write rejected by a fencing token. Shipped: `samples/zombie-leader`
+
+| At-least-once delivery shipped twice
+| A Kafka consumer that crashes after processing and before committing offsets: the next holder of the partition receives the same records
+| Let one instance process the records, `kill()` it, wait for the rebalance; expect the records received again and the effect produced once. Shipped: `samples/crash-redelivery`
+
+| Traffic to a replica that is not ready
+| No readiness probe in the deployment, or one that says UP before the application can serve: a new replica gets requests while it is still loading
+| `running = 1`, a client loop, `start()` the second instance; expect zero errors with `readiness` on and some without. Shipped: `samples/scale-out`
+
+| The readiness cascade
+| An overloaded instance whose readiness check fails, or that sheds its own probe: the balancer ejects it, the load lands on the next instance, which goes the same way
+| Hold A at its limit; expect A to stay ready and answer the excess with 503, and B unaffected
+
+| Requests dropped on rolling restart
+| SIGTERM and the endpoint removal race; proxies route to a stopping pod for a while
+| A client that never stops, a deregistration lag, `stop()` one instance; expect zero errors with `quarkus.shutdown.delay` and some without. Shipped: `samples/rolling-restart`
+
+| Retry amplification across instances
+| A client that retries against instances at their limit, each retry landing on another one. Retries inside one instance against its own pool are a single-instance bug: see `retry-amplification` in Quarkus Network Faults
+| Count attempts at the instances against requests at the client; expect a bounded ratio
+
+| Fleet-wide unready from one dependency
+| Readiness checks that test a shared dependency
+| Not testable yet: nothing here can break a dependency. The cause, one pod leaving the rotation, is `readiness-calls-dependency` in Quarkus Network Faults; what a fleet adds is the outcome the balancer policy implies, refuse or fail open
+
+| A job that dies with its process
+| A long-running job in a thread of one instance, with its progress in memory
+| `kill()` the owner midway; expect the other instance to finish it from a checkpoint. Shipped: `samples/job-killed-midway`
+
+|===
+
+== Timing-based
+
+Possible, not promised as deterministic: a cold JVM instance receiving a full share, thundering herds on
+recovery, metastable failures, retry amplification. They depend on timing or scale, and the test has to be
+written as a probability.
+
+== The shipped scenarios
+
+Every module under `samples/` is one application with a bug, a fleet
+test that fails on it, and a `@TestProfile` that fixes it so that the same test passes. Reading the two test
+classes side by side is the fastest way to see what the extension adds.
+
+[cols="1,2,2"]
+|===
+| Module | The bug | The fix
+
+| `scheduled-job`
+| A `@Scheduled` report runs on every instance: `sent > ticks` with two instances
+| Each run claims its tick with `INSERT ... ON CONFLICT DO NOTHING` first (`report.claim-tick=true`)
+
+| `form-auth`
+| No session encryption key; the cookie instance 0 issues sends the user back to the login page on instance 1
+| `quarkus.http.auth.session.encryption-key` set once for the fleet
+
+| `oidc-login`
+| OIDC with PKCE and the client secret `secret` that Keycloak Dev Services registers; the state cookie instance 0 set before the redirect to Keycloak cannot be decrypted by instance 1 when the browser comes back, and the login fails with 401
+| `quarkus.oidc.authentication.state-secret` set once for the fleet
+
+| `rolling-restart`
+| An instance stops listening on SIGTERM while the balancer keeps routing to it for a second: a client that never stops sees connection errors
+| `quarkus.shutdown.delay=PT2S` (with `quarkus.shutdown.delay-enabled=true` at build time): the instance reports unready and keeps serving through the propagation window
+
+| `zombie-leader`
+| The leader of a leased job is frozen past its lease; the other instance takes over and does the item; the old leader wakes up and records the same item again
+| A fencing token: the write carries the lease token it was acquired with and the database accepts it only while the lease still has that token (`lease.fenced=true`)
+
+| `crash-redelivery`
+| The instance consuming the `orders` partition is killed after shipping and before committing offsets; the survivor receives every order again and ships it again
+| An idempotent consumer: the order id is claimed with a unique insert before shipping (`orders.idempotent=true`)
+
+| `scale-out`
+| A second replica starts while a client is sending; it is listening before its catalog is loaded, and every request routed to it fails. The fix here is in the deployment, not the application
+| A readiness probe: with `readiness` on, the balancer routes to the new instance only once `/q/health/ready` says UP
+
+| `idempotency`
+| Quarkus HTTP Idempotency with its default `in-memory` store: a payment retried with the same `Idempotency-Key` through the other instance is charged again. On one instance the extension works exactly as documented
+| `quarkus.idempotency.store=jdbc`, the store in the shared database: the retry is replayed on any instance, a retry while the first attempt runs elsewhere gets 409, a different payload under the key gets 422
+| `local-cache`
+| `@CacheResult` with the Caffeine backend: `@CacheInvalidate` on the instance that took the write evicts that JVM only, and the other keeps serving the old price
+| Tell the other instances, here over Redis pub/sub (`pricing.invalidate-fleet-wide=true`), or use a shared cache backend
+
+| `rate-limit`
+| `@RateLimit(5)` counts per JVM: a client balanced round robin gets 10 requests through
+| A fleet-wide counter in Redis in front of the resource (`quotes.limit.shared=true`)
+
+| `websocket-broadcast`
+| A WebSockets Next broadcast reaches the sockets of the instance that sends it; clients on the other instance hear nothing
+| Relay the message to every instance over Redis pub/sub (`chat.relay=redis`)
+
+| `outbox-double-send`
+| Two instances poll the same outbox table and both send every pending notification
+| `SELECT ... FOR UPDATE SKIP LOCKED`, so a poller skips the rows another holds (`outbox.skip-locked=true`)
+
+| `pool-exhaustion`
+| Each instance opens its full pool against one `max_connections`: the second instance starts, reports ready, and its requests fail for lack of a connection
+| Size the pool per replica (`quarkus.datasource.jdbc.max-size`)
+
+| `lost-update`
+| Read, compute, write on two instances: a `synchronized` method protects one JVM, and fifty units vanish from a wallet
+| `SELECT ... FOR UPDATE` (`wallet.lock-rows=true`), or optimistic locking with a version column
+
+| `distributed-deadlock`
+| Two transfers lock the same two rows in opposite order on the two instances; Postgres detects the cycle and aborts one with SQLSTATE 40P01. A `synchronized` method serialises transfers within one JVM and hides it
+| A consistent global lock order: always lock the lower account id first (`transfer.lock-order-by-id=true`)
+
+| `write-skew`
+| Both instances check that a slot has room, both pass, and both insert, breaking the capacity limit. No single-row `FOR UPDATE` can stop it and no unique constraint expresses a count
+| `SERIALIZABLE` isolation (`quarkus.datasource.jdbc.transaction-isolation-level`): Postgres aborts the conflicting transaction with SQLSTATE 40001 and the app retries
+
+| `event-ordering`
+| Two instances pull causally ordered events for one subscription from a shared table and apply them in commit order, not event order, so a late `cancel` is overwritten by an earlier `activate`
+| A per-aggregate `SELECT ... FOR UPDATE` held across the apply, plus applying only events newer than the last sequence (`events.ordered-apply=true`)
+
+| `job-killed-midway`
+| A long import runs in a thread of one instance; `kill()` it and the remaining rows are never processed
+| A checkpoint in the database and a reaper on every instance that resumes abandoned jobs (`imports.resumable=true`)
+
+| `upload-local-disk`
+| An upload stored on the instance's disk is a 404 through the other instance; each instance has a temporary directory of its own, as each pod has
+| Shared storage: the database here (`documents.store=database`), object storage or a shared volume in production
+
+|===

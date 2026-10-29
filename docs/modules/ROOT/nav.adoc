@@ -1,0 +1,17 @@
+[.list-top-item]
+.Getting Started
+
+* xref:index.adoc[Overview]
+* xref:scenarios.adoc[What a fleet test catches]
+
+[.list-top-item]
+.Reference
+
+* xref:load-balancer.adoc[The load balancer]
+* xref:agents.adoc[For coding agents]
+
+[.list-top-item]
+.Development
+
+* https://github.com/quarkiverse/quarkus-fleet-test[Source Code^,role=github]
+* https://github.com/quarkiverse/quarkus-fleet-test/issues[Issues^,role=github]

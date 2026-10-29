@@ -1,0 +1,40 @@
+= For coding agents
+
+include::./includes/attributes.adoc[]
+
+Fleet tests are a good job for a coding agent: the scenarios are enumerable from what the application uses, the
+shape of each test is fixed, and a failure prints the state of the fleet and the instances' logs, so the agent
+can read why without re-running.
+
+== The skill
+
+The repository ships a skill, in the
+https://agentskills.io[Agent Skills] format, at
+https://github.com/quarkiverse/quarkus-fleet-test/blob/main/skills/quarkus-fleet-test/SKILL.md[`skills/quarkus-fleet-test/SKILL.md`].
+It is the one document an agent needs: it maps the dependencies and configuration of an application to the
+tests worth writing, gives the shape of each, and lists the mistakes that cost the most time. It is written for
+humans too.
+
+To install it for Claude Code, copy the directory into the project's skills:
+
+[source,bash]
+----
+mkdir -p .claude/skills
+cp -r skills/quarkus-fleet-test .claude/skills/
+----
+
+Any other agent that reads `SKILL.md` files takes the same directory; an agent that does not can be pointed at
+the file.
+
+== A prompt that uses it
+
+> Read the quarkus-fleet-test skill, then look at what this application depends on and write the
+> `@QuarkusFleetTest`s that would fail if it were deployed with two replicas: one per row of the skill's table
+> that applies. Run them; when one fails, read the fleet state and the instance logs it prints before changing
+> anything.
+
+== What the agent gets back
+
+* A failure prints `fleet.describe()`: each instance's port, readiness, the connections it served and the
+routing mode, a timeline of what the balancer did, then the last lines of every instance's log.
+* Routing and paused instances reset after each test, so one wrong assumption does not leak into the next test.

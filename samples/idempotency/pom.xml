@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>io.quarkiverse.fleettest</groupId>
+        <artifactId>quarkus-fleet-test-samples-parent</artifactId>
+        <version>999-SNAPSHOT</version>
+    </parent>
+    <artifactId>quarkus-fleet-test-samples-idempotency</artifactId>
+    <name>Quarkus Fleet Test - Samples - HTTP Idempotency</name>
+    <properties>
+        <automatic.module.name>io.quarkiverse.fleettest.samples.idempotency</automatic.module.name>
+        <!-- the first release that builds on Quarkus 4 -->
+        <quarkus-http-idempotency.version>0.4.0</quarkus-http-idempotency.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-agroal</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jdbc-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-flyway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-flyway-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkiverse.idempotency</groupId>
+            <artifactId>quarkus-http-idempotency</artifactId>
+            <version>${quarkus-http-idempotency.version}</version>
+        </dependency>
+        <!-- the idempotency extension's problem-details dependency, on its Quarkus 4 line; the release declares
+             the 3.x line, whose Jackson 2 exception mappers do not exist on Quarkus 4 -->
+        <dependency>
+            <groupId>io.quarkiverse.httpproblem</groupId>
+            <artifactId>quarkus-http-problem</artifactId>
+            <version>4.0.0.Beta1</version>
+        </dependency>
+    </dependencies>
+</project>

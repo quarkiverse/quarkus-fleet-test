@@ -1,0 +1,110 @@
+= The load balancer
+
+include::./includes/attributes.adoc[]
+
+The fleet's load balancer is a TCP proxy. It chooses an instance when a client opens a connection and then
+copies bytes in both directions without reading them. This is what a Kubernetes `Service` is: kube-proxy balances
+connections, not requests. The consequences are worth knowing, because they are the consequences production has:
+
+* A client that opens a connection per request, as RestAssured does by default, is balanced per request.
+* A client that keeps connections alive, as the REST Client, gRPC and the JDK's `HttpClient` do, sticks to the
+instance its connection went to, until that connection is closed. Scaling out does not move it.
+* HTTP/1.1, HTTP/2, gRPC, WebSockets and TLS all go through unchanged.
+
+== Routing
+
+[cols="1,2"]
+|===
+| `fleet.url()` | The address of the load balancer. RestAssured and `@TestHTTPResource` already point there.
+| `fleet.roundRobin()` | Each new connection goes to the next ready instance. The default, restored after each test.
+| `fleet.pin(i)` | Every new connection goes to instance `i`. Open connections are not moved.
++| `fleet.instance(i).url()` | Instance `i` itself, bypassing the balancer.
+| `fleet.readyInstances()` | The instances new connections currently go to.
+| `fleet.describe()` | Every instance with its port, state, connection count and log file. Printed when a test fails.
+|===
+
+== Readiness
+
+Off by default: every running instance is routed to. On, the balancer behaves like a kubelet and kube-proxy:
+
+[source,java]
+----
+@QuarkusFleetTest(instances = 2, readiness = @Readiness(
+        path = "/q/health/ready",       // polled on every instance; 2xx is a success
+        intervalMillis = 100,           // a kubelet defaults to 10 s; a test wants less
+        failureThreshold = 1,           // consecutive failures before an instance is unready (kubelet: 3)
+        successThreshold = 1,           // consecutive successes before it is ready again (kubelet: 1)
+        deregistrationLagMillis = 1000, // how long it keeps being routed to after going unready or stopping
+        failOpen = false))              // with nothing ready: refuse (kube-proxy) or route to all (ALB, Envoy)
+----
+
+The deregistration lag is the propagation delay between an endpoint change and every proxy acting on it. It is
+the window `quarkus.shutdown.delay` exists for, and the window in which a stopped instance still receives
+connections that fail. `fleet.instance(i).isReady()` and `readinessTransitions()` expose what the balancer sees;
+an instance that flaps under load shows in the transition count. With readiness on, `start()` returns once the
+new process is ready, as a new pod only receives traffic once it is.
+
+The two behaviours for a fleet with no ready instance exist because real balancers disagree: kube-proxy installs
+a reject rule for a Service without ready endpoints, while an AWS ALB and Envoy in panic mode route to every
+target anyway. Which one a test models decides whether a dependency outage that fails every readiness check
+looks like a total outage or like degraded service.
+
+== Processes
+
+`fleet.instance(i).stop()` shuts the process down the way an orchestrator does, with SIGTERM, and waits for it;
+`start()` launches a new process with the same configuration, on a new port. The `fleet-test.instance-index`
+system property tells each process which instance it is, for the rare test that needs to know who answered.
+
+Two more things happen to processes in production, and the test can do both:
+
+`kill()`:: SIGKILL, or `docker kill` for a container. Nothing in the process runs after it: no shutdown hooks,
+no commit, no leaving a consumer group, no releasing a lock. It is a pod OOM-killed or a node lost. The balancer
+treats it as a stop, so with a deregistration lag it keeps routing to the dead port for that long, and those
+connections are refused.
+`pause()` and `resume()`:: SIGSTOP and SIGCONT, or `docker pause` and `docker unpause`. The process stays alive
+and keeps every socket, lock and lease it holds, but nothing in it runs: a long GC pause, a frozen VM, a
+partitioned node. The balancer is not told. The kernel still accepts connections on its port, so a client sees a
+request that never answers, and with readiness on the probe times out and the instance leaves rotation after
+the failure threshold. Everything it was doing continues on `resume()`, including the write it was about to
+make with a lease it has since lost. A paused instance is resumed after each test.
+
+A fleet can also start smaller than its size: `@QuarkusFleetTest(instances = 2, running = 1)` starts instance 0
+before the tests and leaves instance 1 for a test to `start()`, which is how a test watches a replica join: a
+scale-out, a consumer group rebalance, a node joining a cluster. With readiness on, the new instance is routed
+to only once the probe says so.
+
+[#when-a-test-fails]
+== When a test fails
+
+A failing multi-instance test is hard to read from the assertion alone: the cause is usually something that
+happened to an instance or to the routing during the test, not at the line that failed. On failure the extension
+prints the fleet's state, a timeline of what the load balancer did, and the tail of each instance's log, and
+writes the same report to `target/fleet-test/<test>-fleet.txt` so it survives in CI. For the crash-redelivery
+test, where a killed Kafka consumer's partition is slow to move, it looks like this:
+
+----
+Fleet state when ordersReceivedAgainAreNotShippedAgain() failed:
+Fleet of 2 at http://localhost:46435, round-robin
+  instance 0: stopped, readiness transitions 0, served 6 connection(s), log: target/test-GXXHD/quarkus.log
+  instance 1: running on port 44527, ready, readiness transitions 0, served 5 connection(s), log: target/test-dMzXk/quarkus.log
+  what the load balancer did during the test:
+    11:35:02.003 (+ 0.000s) instance 0 started on port 44119
+    11:35:02.857 (+ 0.854s) instance 1 started on port 44527
+    11:35:04.226 (+ 2.223s) instance 0 killed
+  last 17 line(s) of instance 1 (target/test-dMzXk/quarkus.log):
+    ... the survivor's log, where the Kafka rebalance should appear ...
+----
+
+The timeline's wall-clock times match the timestamps in the instance logs, so a cause the balancer caused and an
+effect in the application line up directly. Here the balancer killed instance 0 at 2.2 s and did nothing after,
+so a wait that never finishes is downstream of the balancer: Kafka has not moved the partition to the survivor
+yet.
+
+The snapshot line per instance shows its port, whether it is running, paused or stopped and ready, its
+readiness-transition count, and how many connections the balancer sent it during the test; a `served` count
+that is zero where you expected traffic, or a `connection(s) refused` note on the header, is often the whole
+story. The timeline records routing changes (`routing pinned to instance 0`), readiness flips (`instance 1
+became unready (probe /q/health/ready failed 1 times)`) and lifecycle calls (`started`, `stopped`, `killed`,
+`paused`, `resumed`). Above the log tail, any
+warnings and errors from earlier in that log are surfaced on their own, so a single stack trace is not buried
+under a chatty startup.

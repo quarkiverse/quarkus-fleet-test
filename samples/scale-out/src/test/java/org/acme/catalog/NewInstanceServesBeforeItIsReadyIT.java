@@ -1,0 +1,38 @@
+package org.acme.catalog;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+import java.io.IOException;
+import java.time.Duration;
+
+import org.junit.jupiter.api.Test;
+
+import io.quarkiverse.fleettest.Fleet;
+import io.quarkiverse.fleettest.InjectFleet;
+import io.quarkiverse.fleettest.QuarkusFleetTest;
+import io.quarkiverse.fleettest.RawHttp;
+import io.quarkiverse.fleettest.Traffic;
+
+/**
+ * The bug: no readiness probe in the deployment. A new replica gets traffic as soon as it listens, and for the
+ * seconds it spends loading, every request routed to it fails.
+ */
+@QuarkusFleetTest(instances = 2, running = 1)
+class NewInstanceServesBeforeItIsReadyIT {
+
+    @InjectFleet
+    Fleet fleet;
+
+    @Test
+    void requestsRoutedToTheLoadingInstanceFail() throws Exception {
+        // the first instance has finished loading; nothing the client sees is its doing
+        await().atMost(Duration.ofSeconds(10)).ignoreExceptionsInstanceOf(IOException.class)
+                .until(() -> RawHttp.get(fleet.instance(0).url(), "/catalog") == 200);
+
+        // a client that never stops sending requests, and the second instance started in the middle
+        Traffic.Outcome outcome = Traffic.during(fleet, "/catalog", Duration.ofSeconds(4), () -> fleet.instance(1).start());
+        assertThat(outcome.succeeded()).isGreaterThan(0);
+        assertThat(outcome.failed()).isGreaterThan(0);
+    }
+}
