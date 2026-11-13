@@ -4,7 +4,7 @@
     <parent>
         <groupId>io.quarkiverse.fleettest</groupId>
         <artifactId>quarkus-fleet-test-samples-parent</artifactId>
-        <version>0.1.2</version>
+        <version>999-SNAPSHOT</version>
     </parent>
     <artifactId>quarkus-fleet-test-samples-outbox-double-send</artifactId>
     <name>Quarkus Fleet Test - Samples - Outbox Double Send</name>
