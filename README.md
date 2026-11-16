@@ -1,6 +1,7 @@
 # Quarkus Fleet Test
 
-[![Quarkus](https://img.shields.io/badge/Quarkus-4.0.0.Beta3%2B-4695EB?logo=quarkus&style=flat-square)](https://quarkus.io/)
+[![Version](https://img.shields.io/maven-central/v/io.quarkiverse.fleettest/quarkus-fleet-test?logo=apache-maven&style=flat-square)](https://central.sonatype.com/artifact/io.quarkiverse.fleettest/quarkus-fleet-test)
+[![Quarkus](https://img.shields.io/badge/Quarkus-4.0.0.CR1%2B-4695EB?logo=quarkus&style=flat-square)](https://quarkus.io/)
 
 **Run several instances of your application behind a load balancer, inside one JUnit test.**
 
